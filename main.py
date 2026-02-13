@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 import cv2
-import dxcam
 import keyboard
 import numpy as np
 import pytesseract
@@ -21,6 +20,11 @@ from PIL import Image, ImageTk
 from rapidfuzz import fuzz
 import tkinter as tk
 import winsound
+
+try:
+    from windows_capture import WindowsCapture
+except Exception:  # pragma: no cover - runtime environment dependent
+    WindowsCapture = None
 
 REGION_FILE = Path("region.json")
 DEFAULT_TESSERACT_PATH = r"C:\\Program Files\\Tesseract-OCR\\tesseract.exe"
@@ -38,7 +42,64 @@ NORMAL_INTERVAL = 0.18
 FAST_INTERVAL = 0.06
 FUZZ_THRESHOLD_DEFAULT = 86
 
-KATAKANA_WHITELIST = "アイウエオカキクケコサシスセソタチツテトナニヌネノハヒフヘホマミムメモヤユヨラリルレロワヲンァィゥェォャュョッー・ヴガギグゲゴザジズゼゾダヂヅデドバビブベボパピプペポ0123456789"
+DEFAULT_BINARY_OCR = False
+DEFAULT_LINE_SPLIT_COUNT = 6
+
+
+class WGCCapturer:
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._last_frame: Optional[np.ndarray] = None
+        self._capture: Optional[WindowsCapture] = None
+        self._running = False
+
+        if WindowsCapture is None:
+            logging.warning("event=wgc status=unavailable reason=missing_module")
+            return
+
+        self._capture = WindowsCapture(
+            cursor_capture=False,
+            draw_border=False,
+            monitor_index=1,
+            window_name=None,
+        )
+
+        @self._capture.event
+        def on_frame_arrived(frame, _capture_control) -> None:
+            try:
+                buffer = frame.convert_to_bgr()
+                with self._lock:
+                    self._last_frame = np.asarray(buffer).copy()
+            except Exception:
+                logging.exception("event=wgc status=frame_copy_failed")
+
+        @self._capture.event
+        def on_closed() -> None:
+            self._running = False
+            logging.warning("event=wgc status=closed")
+
+    def start(self) -> None:
+        if self._capture is None or self._running:
+            return
+        self._capture.start_free_threaded()
+        self._running = True
+        logging.info("event=wgc status=started")
+
+    def grab(self, region: Region) -> Optional[np.ndarray]:
+        if not self._running:
+            self.start()
+        with self._lock:
+            frame = None if self._last_frame is None else self._last_frame.copy()
+        if frame is None:
+            return None
+        h, w = frame.shape[:2]
+        left = max(0, min(region.left, w - 1))
+        right = max(0, min(region.right, w))
+        top = max(0, min(region.top, h - 1))
+        bottom = max(0, min(region.bottom, h))
+        if right <= left or bottom <= top:
+            return None
+        return frame[top:bottom, left:right]
 
 
 class POINT(ctypes.Structure):
@@ -132,13 +193,14 @@ class EU5LocationFinder:
         self.last_ocr_text = ""
         self.last_capture_ok = False
         self.last_capture_reason = "not_started"
+        self.capture_fail_streak = 0
         self.last_heartbeat_time = 0.0
         self.monitor_thread_started = False
         self.pending_pick_corner: Optional[str] = None
         self.pick_armed = False
         self.last_lbutton_down = False
 
-        self.camera = dxcam.create(output_color="BGR")
+        self.camera = WGCCapturer()
         self.monitor_thread = threading.Thread(
             target=self.monitor_loop,
             daemon=True,
@@ -170,6 +232,8 @@ class EU5LocationFinder:
         self.request_clear_alert = False
         self.pending_alert: Optional[Tuple[np.ndarray, str, int]] = None
         self.resume_monitor_after_input = False
+        self.ocr_binary_enabled = DEFAULT_BINARY_OCR
+        self.ocr_line_split_count = DEFAULT_LINE_SPLIT_COUNT
 
         if os.path.exists(DEFAULT_TESSERACT_PATH):
             pytesseract.pytesseract.tesseract_cmd = DEFAULT_TESSERACT_PATH
@@ -315,6 +379,7 @@ class EU5LocationFinder:
             self.monitoring = value
             monitoring = self.monitoring
             self.recent_matches.clear()
+            self.capture_fail_streak = 0
         self.print_status(f"Monitoring: {'ON' if monitoring else 'OFF'}")
         logging.info("monitor=%s source=%s", "ON" if monitoring else "OFF", source)
 
@@ -366,7 +431,7 @@ class EU5LocationFinder:
                             frame=frame,
                         )
                         interval = FAST_INTERVAL if fast_mode else NORMAL_INTERVAL
-                        time.sleep(interval)
+                        time.sleep(0.05 if not cap_ok else interval)
                     else:
                         time.sleep(0.05)
                 except Exception:
@@ -415,35 +480,46 @@ class EU5LocationFinder:
 
     def capture_region(self) -> Tuple[Optional[np.ndarray], bool, str]:
         if not self.region:
-            return None, False, "None"
-        try:
-            frame = self.camera.grab(region=self.region.as_tuple())
-            if frame is None:
-                logging.warning("event=capture status=failed reason=None")
-                return None, False, "None"
-            if np.mean(frame) < 1.0:
-                logging.warning("event=capture status=failed reason=black")
-                return None, False, "black"
-            return frame, True, ""
-        except Exception:
-            logging.exception("event=capture status=failed reason=exception")
-            return None, False, "exception"
+            return None, False, "region_unset"
+
+        for attempt in range(3):
+            try:
+                frame = self.camera.grab(region=self.region)
+                if frame is None:
+                    reason = "None"
+                elif np.mean(frame) < 1.0:
+                    reason = "black"
+                else:
+                    with self.state_lock:
+                        self.capture_fail_streak = 0
+                    return frame, True, "ok"
+
+                logging.warning("event=capture status=retry attempt=%s reason=%s", attempt + 1, reason)
+            except Exception:
+                reason = "exception"
+                logging.exception("event=capture status=retry attempt=%s reason=exception", attempt + 1)
+
+            time.sleep(0.05)
+
+        with self.state_lock:
+            self.capture_fail_streak += 1
+            streak = self.capture_fail_streak
+        if streak < 3:
+            logging.warning("event=capture status=soft_fail streak=%s reason=%s", streak, reason)
+            return None, True, f"retrying:{reason}"
+
+        logging.error("event=capture status=failed streak=%s reason=%s", streak, reason)
+        return None, False, f"CAPTURE FAIL:{reason}"
 
     def preprocess(self, frame: np.ndarray) -> np.ndarray:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        up = cv2.resize(gray, None, fx=2.2, fy=2.2, interpolation=cv2.INTER_CUBIC)
-        blur = cv2.GaussianBlur(up, (3, 3), 0)
-        bw = cv2.adaptiveThreshold(
-            blur,
-            255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY,
-            31,
-            3,
-        )
-        kernel = np.ones((2, 2), np.uint8)
-        denoise = cv2.morphologyEx(bw, cv2.MORPH_OPEN, kernel)
-        return denoise
+        enlarged = cv2.resize(gray, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
+        blurred = cv2.GaussianBlur(enlarged, (0, 0), 1.0)
+        sharpened = cv2.addWeighted(enlarged, 1.5, blurred, -0.5, 0)
+
+        if self.ocr_binary_enabled:
+            _, sharpened = cv2.threshold(sharpened, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        return sharpened
 
     def normalize_text(self, text: str) -> str:
         text = unicodedata.normalize("NFKC", text)
@@ -451,16 +527,38 @@ class EU5LocationFinder:
         text = re.sub(r"[\s\u3000]+", "", text)
         return text
 
+    def _ocr_with_psm(self, image: np.ndarray, psm: int) -> str:
+        config = f"--oem 3 --psm {psm} -c preserve_interword_spaces=0"
+        return pytesseract.image_to_string(image, lang="jpn", config=config)
+
+    def _split_lines(self, image: np.ndarray) -> list[np.ndarray]:
+        lines: list[np.ndarray] = []
+        h, _ = image.shape[:2]
+        line_count = max(1, self.ocr_line_split_count)
+        step = max(1, h // line_count)
+        for i in range(line_count):
+            top = i * step
+            bottom = h if i == line_count - 1 else min(h, (i + 1) * step)
+            if bottom - top >= 4:
+                lines.append(image[top:bottom, :])
+        return lines
+
     def ocr_tokens(self, image: np.ndarray) -> list[str]:
         try:
-            config = (
-                "--oem 3 --psm 6 "
-                f"-c tessedit_char_whitelist={KATAKANA_WHITELIST} "
-                "-c preserve_interword_spaces=0"
-            )
-            raw = pytesseract.image_to_string(image, lang="jpn", config=config)
-            pieces = [self.normalize_text(p) for p in re.split(r"[\r\n]+", raw)]
-            return [p for p in pieces if p]
+            raw_psm7 = self._ocr_with_psm(image, psm=7)
+            raw_psm6 = self._ocr_with_psm(image, psm=6)
+            picked = raw_psm7 if len(raw_psm7.strip()) >= len(raw_psm6.strip()) else raw_psm6
+
+            line_tokens: list[str] = []
+            for line_img in self._split_lines(image):
+                line_raw = self._ocr_with_psm(line_img, psm=7)
+                line_tokens.extend(self.normalize_text(p) for p in re.split(r"[\r\n]+", line_raw) if p.strip())
+
+            tokens = [self.normalize_text(p) for p in re.split(r"[\r\n]+", picked)]
+            tokens = [p for p in tokens if p]
+            tokens.extend([t for t in line_tokens if t])
+            deduped = list(dict.fromkeys(tokens))
+            return deduped
         except Exception:
             logging.exception("OCR error")
             raise
@@ -517,7 +615,7 @@ class EU5LocationFinder:
         panel.attributes("-topmost", True)
         panel.resizable(False, False)
         panel.configure(bg="#1e1e1e")
-        panel.geometry("360x280+20+20")
+        panel.geometry("430x320+20+20")
 
         self.control_info_label = tk.Label(
             panel,
@@ -551,7 +649,25 @@ class EU5LocationFinder:
         row4 = tk.Frame(panel, bg="#1e1e1e")
         row4.pack(fill="x", padx=8, pady=2)
         tk.Button(row4, text="Clear Alert", width=17, command=self.clear_alert).pack(side="left", padx=2)
-        tk.Button(row4, text="Quit", width=17, command=self.root.destroy).pack(side="left", padx=2)
+        tk.Button(row4, text="Test Alert", width=17, command=self.test_alert).pack(side="left", padx=2)
+
+        row5 = tk.Frame(panel, bg="#1e1e1e")
+        row5.pack(fill="x", padx=8, pady=2)
+        tk.Button(row5, text="Quit", width=36, command=self.root.destroy).pack(side="left", padx=2)
+
+    def test_alert(self) -> None:
+        frame = np.zeros((90, 360, 3), dtype=np.uint8)
+        cv2.putText(frame, "TEST ALERT", (12, 54), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 2, cv2.LINE_AA)
+        with self.state_lock:
+            self.alert_active = True
+            self.pending_alert = (frame, "TEST_ALERT", 100)
+        try:
+            winsound.Beep(1500, 200)
+            winsound.Beep(2200, 200)
+            winsound.Beep(2600, 350)
+        except Exception:
+            logging.exception("event=beep status=failed")
+        self.print_status("Test Alert fired.")
 
     def hide_region_overlay(self) -> None:
         self.region_overlay_visible = False
@@ -665,20 +781,26 @@ class EU5LocationFinder:
             return
         with self.state_lock:
             term = self.search_term or "(unset)"
-            region_txt = "SET" if self.region else "UNSET"
+            region = self.region
             monitor_txt = "ON" if self.monitoring else "OFF"
             fast_txt = "ON" if self.fast_mode else "OFF"
             cap_txt = "ok" if self.last_capture_ok else "FAIL"
+            cap_reason = self.last_capture_reason
             ocr_chars = len(self.last_ocr_text)
-            sample = self.last_ocr_text[:24].replace("\n", " ")
+            sample = self.last_ocr_text[:36].replace("\n", " ")
         pick_state = self.pending_pick_corner.upper() if self.pending_pick_corner else "-"
+        region_txt = self.format_region(region)
         self.control_info_label.config(
             text=(
                 f"TERM: {term}\n"
-                f"REGION: {region_txt}  MONITOR: {monitor_txt}  FAST: {fast_txt}\n"
-                f"LAST: CAPTURE {cap_txt}, OCR chars={ocr_chars}, sample=\"{sample}\"\n"
+                f"REGION: {region_txt}\n"
+                f"MONITOR: {monitor_txt}  FAST: {fast_txt}\n"
+                f"CAPTURE: {cap_txt} ({cap_reason})\n"
+                f"OCR chars: {ocr_chars}\n"
+                f"LAST OCR sample: {sample}\n"
                 f"PICK: {pick_state}"
-            )
+            ),
+            fg="#ff6060" if cap_txt == "FAIL" else "#ffffff",
         )
 
     def ui_tick(self) -> None:
