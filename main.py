@@ -29,6 +29,7 @@ HOTKEY_MAP = {
     "F6": "clear_alert",
     "F7": "set_search_term",
     "F8": "toggle_monitor",
+    "ctrl+shift+m": "toggle_monitor",
     "F9": "record_left_top",
     "F10": "record_right_bottom_and_save",
 }
@@ -151,6 +152,7 @@ class EU5LocationFinder:
         self.term_status_label: Optional[tk.Label] = None
         self.term_dialog_window: Optional[tk.Toplevel] = None
         self.term_entry: Optional[tk.Entry] = None
+        self.dialog_previous_active_hwnd: Optional[int] = None
         self.overlay_photo = None
         self.request_term_dialog = False
         self.request_clear_alert = False
@@ -176,9 +178,11 @@ class EU5LocationFinder:
         keyboard.add_hotkey("F10", self.record_right_bottom_and_save)
         keyboard.add_hotkey("F7", self.set_search_term)
         keyboard.add_hotkey("F8", self.toggle_monitor)
+        keyboard.add_hotkey("ctrl+shift+m", self.toggle_monitor)
         keyboard.add_hotkey("F5", self.toggle_fast_mode)
         keyboard.add_hotkey("F6", self.clear_alert)
         logging.info("event=hotkeys_registered keys=%s", ",".join(HOTKEY_MAP.keys()))
+        logging.info("hotkeys registered")
 
     def log_hotkey(self, key: str) -> None:
         logging.info("HOTKEY %s pressed", key)
@@ -529,6 +533,11 @@ class EU5LocationFinder:
                 self.term_entry.focus_set()
             return
 
+        try:
+            self.dialog_previous_active_hwnd = int(ctypes.windll.user32.GetForegroundWindow())
+        except Exception:
+            self.dialog_previous_active_hwnd = None
+
         win = tk.Toplevel(self.root)
         self.term_dialog_window = win
         win.title("検索語入力")
@@ -558,25 +567,46 @@ class EU5LocationFinder:
                 self.monitoring = resume
                 self.resume_monitor_after_input = False
             self.print_status(f"Search term set: {term}" if term else "Search term cleared.")
-            self.close_term_dialog()
+            self.close_term_dialog("ok")
 
         def cancel() -> None:
             with self.state_lock:
                 resume = self.resume_monitor_after_input and bool(self.search_term)
                 self.monitoring = resume
                 self.resume_monitor_after_input = False
-            self.close_term_dialog()
+            self.close_term_dialog("cancel")
 
         entry.bind("<Return>", lambda _event: submit())
         win.bind("<Escape>", lambda _event: cancel())
         win.protocol("WM_DELETE_WINDOW", cancel)
         entry.focus_set()
 
-    def close_term_dialog(self) -> None:
+    def close_term_dialog(self, reason: str) -> None:
         if self.term_dialog_window:
+            try:
+                self.term_dialog_window.grab_release()
+            except Exception:
+                pass
             self.term_dialog_window.destroy()
             self.term_dialog_window = None
             self.term_entry = None
+
+        try:
+            self.root.focus_force()
+        except Exception:
+            pass
+
+        if self.dialog_previous_active_hwnd:
+            try:
+                ctypes.windll.user32.SetForegroundWindow(self.dialog_previous_active_hwnd)
+            except Exception:
+                pass
+            self.dialog_previous_active_hwnd = None
+
+        self.root.update_idletasks()
+        logging.info("event=term_dialog status=closed reason=%s", reason)
+        logging.info("event=hotkey_system status=alive")
+        self.root.after(200, lambda: logging.info("post-term-dialog tick"))
 
     def show_overlay(self, frame: np.ndarray, token: str, score: int) -> None:
         if self.overlay:
