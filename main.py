@@ -16,6 +16,7 @@ from typing import Optional, Tuple
 
 import cv2
 import keyboard
+import mouse
 import mss
 import numpy as np
 import pytesseract
@@ -39,6 +40,7 @@ HOTKEY_MAP = {
 NORMAL_INTERVAL = 0.18
 FAST_INTERVAL = 0.06
 FUZZ_THRESHOLD_DEFAULT = 86
+SCROLL_IDLE_SECONDS = 0.10
 
 DEFAULT_BINARY_OCR = False
 DEFAULT_LINE_SPLIT_COUNT = 6
@@ -177,6 +179,8 @@ class EU5LocationFinder:
         self.pending_pick_corner: Optional[str] = None
         self.pick_armed = False
         self.last_lbutton_down = False
+        self.last_wheel_time = 0.0
+        self.scroll_capture_pending = False
 
         self.camera: Capturer = MSSCapturer()
         self.monitor_thread = threading.Thread(
@@ -223,6 +227,7 @@ class EU5LocationFinder:
             logging.warning("event=tesseract status=missing path=%s", DEFAULT_TESSERACT_PATH)
 
         self.setup_hotkeys()
+        self.setup_mouse_wheel_hook()
         self.create_control_panel()
         self.show_region_overlay()
         self.root.after(50, self.ui_tick)
@@ -241,6 +246,17 @@ class EU5LocationFinder:
         keyboard.add_hotkey("F6", self.clear_alert)
         logging.info("event=hotkeys_registered keys=%s", ",".join(HOTKEY_MAP.keys()))
         logging.info("hotkeys registered")
+
+    def setup_mouse_wheel_hook(self) -> None:
+        mouse.hook(self.on_mouse_event)
+        logging.info("event=mouse_hook status=registered type=wheel")
+
+    def on_mouse_event(self, event: mouse.MoveEvent | mouse.ButtonEvent | mouse.WheelEvent) -> None:
+        if not isinstance(event, mouse.WheelEvent):
+            return
+        with self.state_lock:
+            self.last_wheel_time = time.time()
+            self.scroll_capture_pending = True
 
     def log_hotkey(self, key: str) -> None:
         logging.info("HOTKEY %s pressed", key)
@@ -361,6 +377,7 @@ class EU5LocationFinder:
             monitoring = self.monitoring
             self.recent_matches.clear()
             self.capture_fail_streak = 0
+            self.scroll_capture_pending = monitoring
         self.print_status(f"Monitoring: {'ON' if monitoring else 'OFF'}")
         logging.info("monitor=%s source=%s", "ON" if monitoring else "OFF", source)
 
@@ -384,7 +401,18 @@ class EU5LocationFinder:
                         fast_mode = self.fast_mode
                         region = self.region
                         term = self.search_term
+                        wheel_elapsed = time.time() - self.last_wheel_time
+                        should_process_frame = (
+                            self.scroll_capture_pending and wheel_elapsed >= SCROLL_IDLE_SECONDS
+                        )
                     if monitoring and not alert_active:
+                        if not should_process_frame:
+                            time.sleep(0.01)
+                            continue
+
+                        with self.state_lock:
+                            self.scroll_capture_pending = False
+
                         frame, cap_ok, cap_reason = self.capture_region()
                         with self.state_lock:
                             self.last_capture_ok = cap_ok
@@ -411,8 +439,7 @@ class EU5LocationFinder:
                             capture_reason=cap_reason,
                             frame=frame,
                         )
-                        interval = FAST_INTERVAL if fast_mode else NORMAL_INTERVAL
-                        time.sleep(0.05 if not cap_ok else interval)
+                        time.sleep(0.01)
                     else:
                         time.sleep(0.05)
                 except Exception:
