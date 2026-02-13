@@ -1,7 +1,7 @@
-windows-capture
 opencv-python
 pytesseract
 rapidfuzz
 keyboard
 pillow
 numpy
+mss
