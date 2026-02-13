@@ -1,4 +1,4 @@
-dxcam
+windows-capture
 opencv-python
 pytesseract
 rapidfuzz

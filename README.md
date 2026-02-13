@@ -5,7 +5,7 @@ Europa Universalis V の MOD 画面にある地名リストを監視し、指定
 ## 特徴
 
 - F9 / F10 で監視範囲をキャリブレーションし `region.json` 保存
-- `dxcam` で指定矩形のみを高速キャプチャ（黒画面対策に有効）
+- Windows Graphics Capture (`windows-capture`) で指定矩形を安定キャプチャ
 - `pytesseract + OpenCV` で日本語 OCR
 - 完全一致 → `rapidfuzz.partial_ratio` の順で判定
 - 通常モード / 高速モード切替（F5）
@@ -53,7 +53,8 @@ python main.py
 4. F7 で検索語を 1 語入力（例: `マンハッタン`）
 5. F8 で監視 ON/OFF
 6. F5 で高速モード ON/OFF
-7. 検出時はオーバーレイ表示 + ビープ、F6 で解除
+7. UI の **Test Alert** でアラート経路を強制確認
+8. 検出時はオーバーレイ表示 + ビープ、F6 で解除
 
 ---
 
@@ -125,5 +126,5 @@ pyinstaller --noconfirm --onefile --name eu5-location-finder main.py
 
 ## 注意
 
-- このツールは Windows 向けです（`winsound`, `dxcam`, `keyboard` 使用）。
+- このツールは Windows 向けです（`winsound`, `windows-capture`, `keyboard` 使用）。
 - ゲームアップデートやフォント変化で OCR 精度が変わる場合があります。定期的に閾値と範囲を見直してください。
