@@ -2,6 +2,7 @@ import ctypes
 import json
 import logging
 import os
+import platform
 import re
 import threading
 import time
@@ -23,6 +24,14 @@ import winsound
 
 REGION_FILE = Path("region.json")
 DEFAULT_TESSERACT_PATH = r"C:\\Program Files\\Tesseract-OCR\\tesseract.exe"
+HOTKEY_MAP = {
+    "F5": "toggle_fast_mode",
+    "F6": "clear_alert",
+    "F7": "set_search_term",
+    "F8": "toggle_monitor",
+    "F9": "record_left_top",
+    "F10": "record_right_bottom_and_save",
+}
 
 NORMAL_INTERVAL = 0.18
 FAST_INTERVAL = 0.06
@@ -39,7 +48,52 @@ def set_dpi_aware() -> None:
     try:
         ctypes.windll.user32.SetProcessDPIAware()
     except Exception:
-        logging.warning("Failed to enable DPI awareness.")
+        logging.exception("event=dpi_awareness status=failed")
+
+
+def setup_logging() -> Path:
+    logs_dir = Path.cwd() / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    log_path = logs_dir / f"app_{timestamp}.log"
+
+    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    root_logger.handlers.clear()
+
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    root_logger.addHandler(file_handler)
+
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+    root_logger.addHandler(stream_handler)
+
+    logging.info("event=logging_initialized log_file=%s", log_path)
+    return log_path
+
+
+def log_startup_environment() -> None:
+    region_candidates = [Path.cwd() / REGION_FILE, Path(__file__).resolve().parent / REGION_FILE]
+    region_status = ", ".join(
+        f"{candidate} exists={candidate.exists()}" for candidate in region_candidates
+    )
+    tesseract_path = Path(DEFAULT_TESSERACT_PATH)
+    logging.info("event=startup python_version=%s", platform.python_version())
+    logging.info("event=startup os=%s", platform.platform())
+    logging.info("event=startup cwd=%s", Path.cwd())
+    logging.info("event=startup main_path=%s", Path(__file__).resolve())
+    logging.info("event=startup region_candidates=%s", region_status)
+    logging.info(
+        "event=startup tesseract_configured_path=%s exists=%s",
+        DEFAULT_TESSERACT_PATH,
+        tesseract_path.exists(),
+    )
+    logging.info(
+        "event=startup hotkeys=%s",
+        ", ".join(f"{key}:{action}" for key, action in HOTKEY_MAP.items()),
+    )
 
 
 def get_cursor_pos() -> Tuple[int, int]:
@@ -74,10 +128,19 @@ class EU5LocationFinder:
         self.alert_active = False
         self.fuzz_threshold = FUZZ_THRESHOLD_DEFAULT
         self.recent_matches = deque(maxlen=4)
+        self.last_ocr_text = ""
+        self.last_heartbeat_time = 0.0
+        self.monitor_thread_started = False
 
         self.camera = dxcam.create(output_color="BGR")
-        self.monitor_thread = threading.Thread(target=self.monitor_loop, daemon=True)
+        self.monitor_thread = threading.Thread(
+            target=self.monitor_loop,
+            daemon=True,
+            name="monitor_loop_thread",
+        )
         self.monitor_thread.start()
+        self.monitor_thread_started = True
+        logging.info("event=thread status=started name=%s", self.monitor_thread.name)
 
         self.root = tk.Tk()
         self.root.withdraw()
@@ -96,6 +159,9 @@ class EU5LocationFinder:
 
         if os.path.exists(DEFAULT_TESSERACT_PATH):
             pytesseract.pytesseract.tesseract_cmd = DEFAULT_TESSERACT_PATH
+            logging.info("event=tesseract status=configured path=%s", DEFAULT_TESSERACT_PATH)
+        else:
+            logging.warning("event=tesseract status=missing path=%s", DEFAULT_TESSERACT_PATH)
 
         self.setup_hotkeys()
         self.create_term_status_window()
@@ -103,8 +169,7 @@ class EU5LocationFinder:
         self.print_status("Ready. F7=word F8=monitor F9/F10=region F5=fast F6=clear")
 
     def print_status(self, msg: str) -> None:
-        logging.info(msg)
-        print(msg)
+        logging.info("event=status message=%s", msg)
 
     def setup_hotkeys(self) -> None:
         keyboard.add_hotkey("F9", self.record_left_top)
@@ -113,6 +178,10 @@ class EU5LocationFinder:
         keyboard.add_hotkey("F8", self.toggle_monitor)
         keyboard.add_hotkey("F5", self.toggle_fast_mode)
         keyboard.add_hotkey("F6", self.clear_alert)
+        logging.info("event=hotkeys_registered keys=%s", ",".join(HOTKEY_MAP.keys()))
+
+    def log_hotkey(self, key: str) -> None:
+        logging.info("HOTKEY %s pressed", key)
 
     def load_region(self) -> Optional[Region]:
         if not REGION_FILE.exists():
@@ -140,89 +209,159 @@ class EU5LocationFinder:
         self.print_status(f"Saved region: {self.region}")
 
     def record_left_top(self) -> None:
-        self.corner_lt = get_cursor_pos()
-        self.print_status(f"F9 captured left-top: {self.corner_lt}")
+        self.log_hotkey("F9")
+        try:
+            self.corner_lt = get_cursor_pos()
+            self.print_status(f"F9 captured left-top: {self.corner_lt}")
+        except Exception:
+            logging.exception("event=hotkey_error key=F9")
 
     def record_right_bottom_and_save(self) -> None:
-        self.corner_rb = get_cursor_pos()
-        self.print_status(f"F10 captured right-bottom: {self.corner_rb}")
-        if not self.corner_lt:
-            self.print_status("Left-top is missing. Press F9 first.")
-            return
-        left = min(self.corner_lt[0], self.corner_rb[0])
-        top = min(self.corner_lt[1], self.corner_rb[1])
-        right = max(self.corner_lt[0], self.corner_rb[0])
-        bottom = max(self.corner_lt[1], self.corner_rb[1])
-        region = Region(left, top, right, bottom)
-        if not region.is_valid():
-            self.print_status("Invalid region; capture again.")
-            return
-        self.region = region
-        self.save_region()
+        self.log_hotkey("F10")
+        try:
+            self.corner_rb = get_cursor_pos()
+            self.print_status(f"F10 captured right-bottom: {self.corner_rb}")
+            if not self.corner_lt:
+                self.print_status("Left-top is missing. Press F9 first.")
+                return
+            left = min(self.corner_lt[0], self.corner_rb[0])
+            top = min(self.corner_lt[1], self.corner_rb[1])
+            right = max(self.corner_lt[0], self.corner_rb[0])
+            bottom = max(self.corner_lt[1], self.corner_rb[1])
+            region = Region(left, top, right, bottom)
+            if not region.is_valid():
+                self.print_status("Invalid region; capture again.")
+                return
+            self.region = region
+            self.save_region()
+        except Exception:
+            logging.exception("event=hotkey_error key=F10")
 
     def set_search_term(self) -> None:
-        with self.state_lock:
-            self.request_term_dialog = True
+        self.log_hotkey("F7")
+        try:
+            with self.state_lock:
+                self.request_term_dialog = True
+            logging.info("event=search_term_dialog status=requested")
+        except Exception:
+            logging.exception("event=hotkey_error key=F7")
 
     def toggle_fast_mode(self) -> None:
-        with self.state_lock:
-            self.fast_mode = not self.fast_mode
-            fast_mode = self.fast_mode
-        self.print_status(f"Fast mode: {'ON' if fast_mode else 'OFF'}")
+        self.log_hotkey("F5")
+        try:
+            with self.state_lock:
+                self.fast_mode = not self.fast_mode
+                fast_mode = self.fast_mode
+            self.print_status(f"Fast mode: {'ON' if fast_mode else 'OFF'}")
+        except Exception:
+            logging.exception("event=hotkey_error key=F5")
 
     def toggle_monitor(self) -> None:
-        with self.state_lock:
-            alert_active = self.alert_active
-            region = self.region
-            search_term = self.search_term
-        if alert_active:
-            self.print_status("Alert active. Press F6 to clear first.")
-            return
-        if not region:
-            self.print_status("Region not configured. Use F9/F10 first.")
-            return
-        if not search_term:
-            self.print_status("Search term is empty. Use F7 first.")
-            return
-        with self.state_lock:
-            self.monitoring = not self.monitoring
-            monitoring = self.monitoring
-            self.recent_matches.clear()
-        self.print_status(f"Monitoring: {'ON' if monitoring else 'OFF'}")
+        self.log_hotkey("F8")
+        try:
+            with self.state_lock:
+                alert_active = self.alert_active
+                region = self.region
+                search_term = self.search_term
+            if alert_active:
+                self.print_status("Alert active. Press F6 to clear first.")
+                return
+            if not region:
+                self.print_status("Region not configured. Use F9/F10 first.")
+                return
+            if not search_term:
+                self.print_status("Search term is empty. Use F7 first.")
+                return
+            with self.state_lock:
+                self.monitoring = not self.monitoring
+                monitoring = self.monitoring
+                self.recent_matches.clear()
+            self.print_status(f"Monitoring: {'ON' if monitoring else 'OFF'}")
+        except Exception:
+            logging.exception("event=hotkey_error key=F8")
 
     def clear_alert(self) -> None:
-        with self.state_lock:
-            self.request_clear_alert = True
+        self.log_hotkey("F6")
+        try:
+            with self.state_lock:
+                self.request_clear_alert = True
+            logging.info("event=alert_clear status=requested")
+        except Exception:
+            logging.exception("event=hotkey_error key=F6")
 
     def monitor_loop(self) -> None:
-        while True:
-            try:
-                with self.state_lock:
-                    monitoring = self.monitoring
-                    alert_active = self.alert_active
-                    fast_mode = self.fast_mode
-                if monitoring and not alert_active:
-                    frame = self.capture_region()
-                    if frame is not None:
-                        hit, score, token = self.detect_term(frame)
-                        with self.state_lock:
-                            self.recent_matches.append((hit, score, token, frame))
-                            should_fire = self.should_fire_alert()
-                            best_candidate = (
-                                max(self.recent_matches, key=lambda x: x[1])
-                                if should_fire
-                                else None
-                            )
-                        if best_candidate is not None:
-                            _, best_score, best_token, best_frame = best_candidate
-                            self.on_hit(best_frame, best_token, best_score)
-                    interval = FAST_INTERVAL if fast_mode else NORMAL_INTERVAL
-                    time.sleep(interval)
-                else:
-                    time.sleep(0.05)
-            except Exception as e:
-                logging.exception("Monitor loop error: %s", e)
-                time.sleep(0.2)
+        logging.info("event=thread_loop status=running name=monitor_loop_thread")
+        try:
+            while True:
+                try:
+                    with self.state_lock:
+                        monitoring = self.monitoring
+                        alert_active = self.alert_active
+                        fast_mode = self.fast_mode
+                        region = self.region
+                        term = self.search_term
+                    if monitoring and not alert_active:
+                        frame, cap_ok, cap_reason = self.capture_region()
+                        if frame is not None:
+                            hit, score, token = self.detect_term(frame)
+                            with self.state_lock:
+                                self.recent_matches.append((hit, score, token, frame))
+                                should_fire = self.should_fire_alert()
+                                best_candidate = (
+                                    max(self.recent_matches, key=lambda x: x[1])
+                                    if should_fire
+                                    else None
+                                )
+                            if best_candidate is not None:
+                                _, best_score, best_token, best_frame = best_candidate
+                                self.on_hit(best_frame, best_token, best_score)
+                        self.emit_heartbeat(
+                            monitoring=monitoring,
+                            fast_mode=fast_mode,
+                            region_set=region is not None,
+                            term=term,
+                            capture_ok=cap_ok,
+                            capture_reason=cap_reason,
+                            frame=frame,
+                        )
+                        interval = FAST_INTERVAL if fast_mode else NORMAL_INTERVAL
+                        time.sleep(interval)
+                    else:
+                        time.sleep(0.05)
+                except Exception:
+                    logging.exception("event=monitor_loop_error")
+                    time.sleep(0.2)
+        except Exception:
+            logging.exception("event=thread status=stopped name=monitor_loop_thread reason=exception")
+
+    def emit_heartbeat(
+        self,
+        monitoring: bool,
+        fast_mode: bool,
+        region_set: bool,
+        term: str,
+        capture_ok: bool,
+        capture_reason: str,
+        frame: Optional[np.ndarray],
+    ) -> None:
+        now = time.time()
+        if now - self.last_heartbeat_time < 1.0:
+            return
+        self.last_heartbeat_time = now
+        logging.info(
+            'HEARTBEAT monitor=%s fast=%s region=%s term="%s"',
+            "ON" if monitoring else "OFF",
+            "ON" if fast_mode else "OFF",
+            "SET" if region_set else "UNSET",
+            term,
+        )
+        if capture_ok and frame is not None:
+            h, w = frame.shape[:2]
+            logging.info("CAPTURE ok=True size=%sx%s", w, h)
+        else:
+            logging.info('CAPTURE ok=False reason="%s"', capture_reason)
+        sample = self.last_ocr_text[:30].replace("\n", " ")
+        logging.info('OCR chars=%s sample="%s"', len(self.last_ocr_text), sample)
 
     def should_fire_alert(self) -> bool:
         if not self.recent_matches:
@@ -232,20 +371,21 @@ class EU5LocationFinder:
         high_scores = [s for _, s, _, _ in self.recent_matches if s >= self.fuzz_threshold + 7]
         return len(high_scores) >= 2
 
-    def capture_region(self) -> Optional[np.ndarray]:
+    def capture_region(self) -> Tuple[Optional[np.ndarray], bool, str]:
         if not self.region:
-            return None
+            return None, False, "None"
         try:
             frame = self.camera.grab(region=self.region.as_tuple())
             if frame is None:
-                logging.warning("Capture failed: empty frame.")
-                return None
+                logging.warning("event=capture status=failed reason=None")
+                return None, False, "None"
             if np.mean(frame) < 1.0:
-                logging.warning("Capture appears black. Check borderless/window mode or admin rights.")
-            return frame
-        except Exception as e:
-            logging.error("Capture failure: %s", e)
-            return None
+                logging.warning("event=capture status=failed reason=black")
+                return None, False, "black"
+            return frame, True, ""
+        except Exception:
+            logging.exception("event=capture status=failed reason=exception")
+            return None, False, "exception"
 
     def preprocess(self, frame: np.ndarray) -> np.ndarray:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -270,19 +410,24 @@ class EU5LocationFinder:
         return text
 
     def ocr_tokens(self, image: np.ndarray) -> list[str]:
-        config = (
-            "--oem 3 --psm 6 "
-            f"-c tessedit_char_whitelist={KATAKANA_WHITELIST} "
-            "-c preserve_interword_spaces=0"
-        )
-        raw = pytesseract.image_to_string(image, lang="jpn", config=config)
-        pieces = [self.normalize_text(p) for p in re.split(r"[\r\n]+", raw)]
-        return [p for p in pieces if p]
+        try:
+            config = (
+                "--oem 3 --psm 6 "
+                f"-c tessedit_char_whitelist={KATAKANA_WHITELIST} "
+                "-c preserve_interword_spaces=0"
+            )
+            raw = pytesseract.image_to_string(image, lang="jpn", config=config)
+            pieces = [self.normalize_text(p) for p in re.split(r"[\r\n]+", raw)]
+            return [p for p in pieces if p]
+        except Exception:
+            logging.exception("OCR error")
+            raise
 
     def detect_term(self, frame: np.ndarray) -> Tuple[bool, int, str]:
         try:
             prep = self.preprocess(frame)
             tokens = self.ocr_tokens(prep)
+            self.last_ocr_text = " ".join(tokens)
             if not tokens:
                 return False, 0, ""
 
@@ -303,8 +448,8 @@ class EU5LocationFinder:
                     best_token = token
 
             return best_score >= fuzz_threshold, int(best_score), best_token
-        except Exception as e:
-            logging.error("OCR error: %s", e)
+        except Exception:
+            logging.exception("event=detect_term status=failed")
             return False, 0, ""
 
     def on_hit(self, frame: np.ndarray, token: str, score: int) -> None:
@@ -317,7 +462,7 @@ class EU5LocationFinder:
             winsound.Beep(1800, 300)
             winsound.Beep(2200, 500)
         except Exception:
-            pass
+            logging.exception("event=beep status=failed")
 
     def create_term_status_window(self) -> None:
         self.term_status_window = tk.Toplevel(self.root)
@@ -468,10 +613,8 @@ class EU5LocationFinder:
 
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-    )
+    setup_logging()
+    log_startup_environment()
     set_dpi_aware()
     app = EU5LocationFinder()
     app.run()
