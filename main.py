@@ -52,8 +52,7 @@ class Capturer:
 class MSSCapturer(Capturer):
     def __init__(self) -> None:
         self._lock = threading.RLock()
-        self._sct = mss.mss()
-        logging.info("event=capturer type=mss status=initialized")
+        logging.info("event=capturer type=mss status=lazy_initialized")
 
     def grab(self, region: "Region") -> np.ndarray:
         width = region.right - region.left
@@ -69,7 +68,8 @@ class MSSCapturer(Capturer):
         }
 
         with self._lock:
-            raw = self._sct.grab(monitor)
+            with mss.mss() as sct:
+                raw = sct.grab(monitor)
 
         frame = np.asarray(raw)
         if frame.size == 0:
