@@ -19,7 +19,6 @@ import pytesseract
 from PIL import Image, ImageTk
 from rapidfuzz import fuzz
 import tkinter as tk
-from tkinter import simpledialog, messagebox
 import winsound
 
 REGION_FILE = Path("region.json")
@@ -65,6 +64,7 @@ class Region:
 
 class EU5LocationFinder:
     def __init__(self) -> None:
+        self.state_lock = threading.RLock()
         self.region: Optional[Region] = self.load_region()
         self.corner_lt: Optional[Tuple[int, int]] = None
         self.corner_rb: Optional[Tuple[int, int]] = None
@@ -84,12 +84,22 @@ class EU5LocationFinder:
         self.overlay: Optional[tk.Toplevel] = None
         self.overlay_image_label: Optional[tk.Label] = None
         self.overlay_text_label: Optional[tk.Label] = None
+        self.term_status_window: Optional[tk.Toplevel] = None
+        self.term_status_label: Optional[tk.Label] = None
+        self.term_dialog_window: Optional[tk.Toplevel] = None
+        self.term_entry: Optional[tk.Entry] = None
         self.overlay_photo = None
+        self.request_term_dialog = False
+        self.request_clear_alert = False
+        self.pending_alert: Optional[Tuple[np.ndarray, str, int]] = None
+        self.resume_monitor_after_input = False
 
         if os.path.exists(DEFAULT_TESSERACT_PATH):
             pytesseract.pytesseract.tesseract_cmd = DEFAULT_TESSERACT_PATH
 
         self.setup_hotkeys()
+        self.create_term_status_window()
+        self.root.after(50, self.ui_tick)
         self.print_status("Ready. F7=word F8=monitor F9/F10=region F5=fast F6=clear")
 
     def print_status(self, msg: str) -> None:
@@ -151,52 +161,62 @@ class EU5LocationFinder:
         self.save_region()
 
     def set_search_term(self) -> None:
-        term = simpledialog.askstring("Search term", "検索語（1語）を入力してください:")
-        if term is None:
-            return
-        self.search_term = self.normalize_text(term)
-        self.print_status(f"Search term set: {self.search_term}")
+        with self.state_lock:
+            self.request_term_dialog = True
 
     def toggle_fast_mode(self) -> None:
-        self.fast_mode = not self.fast_mode
-        self.print_status(f"Fast mode: {'ON' if self.fast_mode else 'OFF'}")
+        with self.state_lock:
+            self.fast_mode = not self.fast_mode
+            fast_mode = self.fast_mode
+        self.print_status(f"Fast mode: {'ON' if fast_mode else 'OFF'}")
 
     def toggle_monitor(self) -> None:
-        if self.alert_active:
+        with self.state_lock:
+            alert_active = self.alert_active
+            region = self.region
+            search_term = self.search_term
+        if alert_active:
             self.print_status("Alert active. Press F6 to clear first.")
             return
-        if not self.region:
+        if not region:
             self.print_status("Region not configured. Use F9/F10 first.")
             return
-        if not self.search_term:
+        if not search_term:
             self.print_status("Search term is empty. Use F7 first.")
             return
-        self.monitoring = not self.monitoring
-        self.recent_matches.clear()
-        self.print_status(f"Monitoring: {'ON' if self.monitoring else 'OFF'}")
+        with self.state_lock:
+            self.monitoring = not self.monitoring
+            monitoring = self.monitoring
+            self.recent_matches.clear()
+        self.print_status(f"Monitoring: {'ON' if monitoring else 'OFF'}")
 
     def clear_alert(self) -> None:
-        if self.overlay:
-            self.overlay.destroy()
-            self.overlay = None
-        self.alert_active = False
-        self.print_status("Alert cleared.")
+        with self.state_lock:
+            self.request_clear_alert = True
 
     def monitor_loop(self) -> None:
         while True:
             try:
-                if self.monitoring and not self.alert_active:
+                with self.state_lock:
+                    monitoring = self.monitoring
+                    alert_active = self.alert_active
+                    fast_mode = self.fast_mode
+                if monitoring and not alert_active:
                     frame = self.capture_region()
                     if frame is not None:
                         hit, score, token = self.detect_term(frame)
-                        self.recent_matches.append((hit, score, token, frame))
-                        if self.should_fire_alert():
-                            _, best_score, best_token, best_frame = max(
-                                self.recent_matches,
-                                key=lambda x: x[1],
+                        with self.state_lock:
+                            self.recent_matches.append((hit, score, token, frame))
+                            should_fire = self.should_fire_alert()
+                            best_candidate = (
+                                max(self.recent_matches, key=lambda x: x[1])
+                                if should_fire
+                                else None
                             )
+                        if best_candidate is not None:
+                            _, best_score, best_token, best_frame = best_candidate
                             self.on_hit(best_frame, best_token, best_score)
-                    interval = FAST_INTERVAL if self.fast_mode else NORMAL_INTERVAL
+                    interval = FAST_INTERVAL if fast_mode else NORMAL_INTERVAL
                     time.sleep(interval)
                 else:
                     time.sleep(0.05)
@@ -266,33 +286,152 @@ class EU5LocationFinder:
             if not tokens:
                 return False, 0, ""
 
+            with self.state_lock:
+                search_term = self.search_term
+                fuzz_threshold = self.fuzz_threshold
+
             for token in tokens:
-                if token == self.search_term:
+                if token == search_term:
                     return True, 100, token
 
             best_score = 0
             best_token = ""
             for token in tokens:
-                score = fuzz.partial_ratio(self.search_term, token)
+                score = fuzz.partial_ratio(search_term, token)
                 if score > best_score:
                     best_score = score
                     best_token = token
 
-            return best_score >= self.fuzz_threshold, int(best_score), best_token
+            return best_score >= fuzz_threshold, int(best_score), best_token
         except Exception as e:
             logging.error("OCR error: %s", e)
             return False, 0, ""
 
     def on_hit(self, frame: np.ndarray, token: str, score: int) -> None:
-        self.monitoring = False
-        self.alert_active = True
+        with self.state_lock:
+            self.monitoring = False
+            self.alert_active = True
+            self.pending_alert = (frame, token, score)
         self.print_status(f"HIT: token={token} score={score}")
         try:
             winsound.Beep(1800, 300)
             winsound.Beep(2200, 500)
         except Exception:
             pass
-        self.root.after(0, lambda: self.show_overlay(frame, token, score))
+
+    def create_term_status_window(self) -> None:
+        self.term_status_window = tk.Toplevel(self.root)
+        self.term_status_window.title("EU5 Search Term")
+        self.term_status_window.attributes("-topmost", True)
+        self.term_status_window.resizable(False, False)
+        self.term_status_window.configure(bg="#202020")
+        self.term_status_label = tk.Label(
+            self.term_status_window,
+            text="現在の検索語: (未設定)",
+            font=("Meiryo", 10, "bold"),
+            fg="#ffffff",
+            bg="#202020",
+            padx=8,
+            pady=6,
+        )
+        self.term_status_label.pack()
+
+    def ui_tick(self) -> None:
+        self.process_ui_requests()
+        self.root.after(50, self.ui_tick)
+
+    def process_ui_requests(self) -> None:
+        with self.state_lock:
+            request_term_dialog = self.request_term_dialog
+            if request_term_dialog:
+                self.request_term_dialog = False
+                self.resume_monitor_after_input = self.monitoring
+                self.monitoring = False
+
+            request_clear_alert = self.request_clear_alert
+            if request_clear_alert:
+                self.request_clear_alert = False
+
+            pending_alert = self.pending_alert
+            if pending_alert is not None:
+                self.pending_alert = None
+
+            search_term = self.search_term
+
+        if self.term_status_label:
+            status_text = f"現在の検索語: {search_term}" if search_term else "現在の検索語: (未設定)"
+            self.term_status_label.config(text=status_text)
+
+        if request_term_dialog:
+            self.show_term_dialog()
+
+        if request_clear_alert:
+            if self.overlay:
+                self.overlay.destroy()
+                self.overlay = None
+            with self.state_lock:
+                self.alert_active = False
+            self.print_status("Alert cleared.")
+
+        if pending_alert is not None:
+            frame, token, score = pending_alert
+            self.show_overlay(frame, token, score)
+
+    def show_term_dialog(self) -> None:
+        if self.term_dialog_window is not None:
+            self.term_dialog_window.lift()
+            if self.term_entry:
+                self.term_entry.focus_set()
+            return
+
+        win = tk.Toplevel(self.root)
+        self.term_dialog_window = win
+        win.title("検索語入力")
+        win.attributes("-topmost", True)
+        win.resizable(False, False)
+        win.configure(bg="#1f1f1f")
+
+        tk.Label(
+            win,
+            text="検索語（1語）を入力",
+            font=("Meiryo", 11, "bold"),
+            fg="#ffffff",
+            bg="#1f1f1f",
+        ).pack(padx=12, pady=(10, 6), anchor="w")
+
+        entry = tk.Entry(win, width=28, font=("Meiryo", 12))
+        with self.state_lock:
+            entry.insert(0, self.search_term)
+        entry.pack(padx=12, pady=(0, 10))
+        self.term_entry = entry
+
+        def submit() -> None:
+            term = self.normalize_text(entry.get())
+            with self.state_lock:
+                self.search_term = term
+                resume = self.resume_monitor_after_input and bool(self.search_term)
+                self.monitoring = resume
+                self.resume_monitor_after_input = False
+            self.print_status(f"Search term set: {term}" if term else "Search term cleared.")
+            self.close_term_dialog()
+
+        def cancel() -> None:
+            with self.state_lock:
+                resume = self.resume_monitor_after_input and bool(self.search_term)
+                self.monitoring = resume
+                self.resume_monitor_after_input = False
+            self.close_term_dialog()
+
+        entry.bind("<Return>", lambda _event: submit())
+        win.bind("<Escape>", lambda _event: cancel())
+        win.protocol("WM_DELETE_WINDOW", cancel)
+        entry.focus_set()
+
+    def close_term_dialog(self) -> None:
+        if self.term_dialog_window:
+            self.term_dialog_window.destroy()
+            self.term_dialog_window = None
+            self.term_entry = None
 
     def show_overlay(self, frame: np.ndarray, token: str, score: int) -> None:
         if self.overlay:
