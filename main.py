@@ -151,6 +151,9 @@ class EU5LocationFinder:
         self.root = tk.Tk()
         self.root.withdraw()
         self.overlay: Optional[tk.Toplevel] = None
+        self.region_overlay: Optional[tk.Toplevel] = None
+        self.region_overlay_canvas: Optional[tk.Canvas] = None
+        self.region_overlay_visible = False
         self.overlay_image_label: Optional[tk.Label] = None
         self.overlay_text_label: Optional[tk.Label] = None
         self.term_status_window: Optional[tk.Toplevel] = None
@@ -176,6 +179,7 @@ class EU5LocationFinder:
 
         self.setup_hotkeys()
         self.create_control_panel()
+        self.show_region_overlay()
         self.root.after(50, self.ui_tick)
         self.print_status("Ready. F7=word F8=monitor F9/F10=region F5=fast F6=clear")
 
@@ -205,7 +209,7 @@ class EU5LocationFinder:
             region = Region(data["left"], data["top"], data["right"], data["bottom"])
             if not region.is_valid():
                 raise ValueError("invalid rectangle")
-            logging.info("Loaded region: %s", region)
+            logging.info("Loaded region: %s", self.format_region(region))
             return region
         except Exception as e:
             logging.error("Failed to load region.json: %s", e)
@@ -219,13 +223,25 @@ class EU5LocationFinder:
             json.dumps(self.region.__dict__, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
-        self.print_status(f"Saved region: {self.region}")
+        self.print_status(f"Saved region: {self.format_region(self.region)}")
+        self.log_region_coordinates("saved")
+
+    def format_region(self, region: Optional[Region]) -> str:
+        if region is None:
+            return "(unset)"
+        return f"left={region.left}, top={region.top}, right={region.right}, bottom={region.bottom}"
+
+    def log_region_coordinates(self, source: str) -> None:
+        with self.state_lock:
+            region = self.region
+        logging.info("event=region source=%s coords=%s", source, self.format_region(region))
 
     def record_left_top(self) -> None:
         self.log_hotkey("F9")
         try:
             self.corner_lt = get_cursor_pos()
             self.print_status(f"F9 captured left-top: {self.corner_lt}")
+            self.log_region_coordinates("f9")
         except Exception:
             logging.exception("event=hotkey_error key=F9")
 
@@ -234,6 +250,7 @@ class EU5LocationFinder:
         try:
             self.corner_rb = get_cursor_pos()
             self.print_status(f"F10 captured right-bottom: {self.corner_rb}")
+            self.log_region_coordinates("f10")
             if not self.corner_lt:
                 self.print_status("Left-top is missing. Press F9 first.")
                 return
@@ -247,6 +264,7 @@ class EU5LocationFinder:
                 return
             self.region = region
             self.save_region()
+            self.show_region_overlay()
         except Exception:
             logging.exception("event=hotkey_error key=F10")
 
@@ -372,10 +390,11 @@ class EU5LocationFinder:
             return
         self.last_heartbeat_time = now
         logging.info(
-            'HEARTBEAT monitor=%s fast=%s region=%s term="%s"',
+            'HEARTBEAT monitor=%s fast=%s region=%s coords="%s" term="%s"',
             "ON" if monitoring else "OFF",
             "ON" if fast_mode else "OFF",
             "SET" if region_set else "UNSET",
+            self.format_region(self.region),
             term,
         )
         if capture_ok and frame is not None:
@@ -498,7 +517,7 @@ class EU5LocationFinder:
         panel.attributes("-topmost", True)
         panel.resizable(False, False)
         panel.configure(bg="#1e1e1e")
-        panel.geometry("360x240+20+20")
+        panel.geometry("360x280+20+20")
 
         self.control_info_label = tk.Label(
             panel,
@@ -526,8 +545,72 @@ class EU5LocationFinder:
 
         row3 = tk.Frame(panel, bg="#1e1e1e")
         row3.pack(fill="x", padx=8, pady=2)
-        tk.Button(row3, text="Clear Alert", width=17, command=self.clear_alert).pack(side="left", padx=2)
-        tk.Button(row3, text="Quit", width=17, command=self.root.destroy).pack(side="left", padx=2)
+        tk.Button(row3, text="Show Region", width=17, command=self.show_region_overlay).pack(side="left", padx=2)
+        tk.Button(row3, text="Hide Region", width=17, command=self.hide_region_overlay).pack(side="left", padx=2)
+
+        row4 = tk.Frame(panel, bg="#1e1e1e")
+        row4.pack(fill="x", padx=8, pady=2)
+        tk.Button(row4, text="Clear Alert", width=17, command=self.clear_alert).pack(side="left", padx=2)
+        tk.Button(row4, text="Quit", width=17, command=self.root.destroy).pack(side="left", padx=2)
+
+    def hide_region_overlay(self) -> None:
+        self.region_overlay_visible = False
+        if self.region_overlay:
+            self.region_overlay.withdraw()
+        self.print_status("Region overlay hidden.")
+
+    def show_region_overlay(self) -> None:
+        self.region_overlay_visible = True
+        self.update_region_overlay()
+
+    def update_region_overlay(self) -> None:
+        if not self.region_overlay_visible:
+            return
+        region = self.region
+        if region is None or not region.is_valid():
+            if self.region_overlay:
+                self.region_overlay.withdraw()
+            return
+
+        width = max(1, region.right - region.left)
+        height = max(1, region.bottom - region.top)
+
+        if self.region_overlay is None:
+            overlay = tk.Toplevel(self.root)
+            overlay.overrideredirect(True)
+            overlay.attributes("-topmost", True)
+            overlay.attributes("-alpha", 0.25)
+            overlay.configure(bg="black")
+
+            canvas = tk.Canvas(overlay, bg="black", highlightthickness=0, bd=0)
+            canvas.pack(fill="both", expand=True)
+
+            self.region_overlay = overlay
+            self.region_overlay_canvas = canvas
+
+        self.region_overlay.geometry(f"{width}x{height}+{region.left}+{region.top}")
+        self.region_overlay.deiconify()
+        self.region_overlay.lift()
+
+        if self.region_overlay_canvas:
+            self.region_overlay_canvas.configure(width=width, height=height)
+            self.region_overlay_canvas.delete("all")
+            self.region_overlay_canvas.create_rectangle(
+                1,
+                1,
+                width - 2,
+                height - 2,
+                outline="#ff0000",
+                width=3,
+            )
+            self.region_overlay_canvas.create_text(
+                8,
+                8,
+                text=f"region({region.left}, {region.top}, {region.right}, {region.bottom})",
+                fill="#ff0000",
+                anchor="nw",
+                font=("Meiryo", 10, "bold"),
+            )
 
     def toggle_monitor_ui(self) -> None:
         self.toggle_monitor(source="ui")
@@ -569,6 +652,7 @@ class EU5LocationFinder:
                     if region.is_valid():
                         self.region = region
                         self.save_region()
+                        self.show_region_overlay()
                     else:
                         self.print_status("Invalid region; capture LT/RB again.")
             self.pending_pick_corner = None
@@ -639,6 +723,8 @@ class EU5LocationFinder:
         if pending_alert is not None:
             frame, token, score = pending_alert
             self.show_overlay(frame, token, score)
+
+        self.update_region_overlay()
 
     def show_term_dialog(self) -> None:
         if self.term_dialog_window is not None:
