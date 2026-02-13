@@ -16,17 +16,13 @@ from typing import Optional, Tuple
 
 import cv2
 import keyboard
+import mss
 import numpy as np
 import pytesseract
 from PIL import Image, ImageTk
 from rapidfuzz import fuzz
 import tkinter as tk
 import winsound
-
-try:
-    from windows_capture import WindowsCapture
-except Exception:  # pragma: no cover - runtime environment dependent
-    WindowsCapture = None
 
 REGION_FILE = Path("region.json")
 DEFAULT_TESSERACT_PATH = r"C:\\Program Files\\Tesseract-OCR\\tesseract.exe"
@@ -48,60 +44,40 @@ DEFAULT_BINARY_OCR = False
 DEFAULT_LINE_SPLIT_COUNT = 6
 
 
-class WGCCapturer:
+class Capturer:
+    def grab(self, region: "Region") -> np.ndarray:
+        raise NotImplementedError
+
+
+class MSSCapturer(Capturer):
     def __init__(self) -> None:
         self._lock = threading.RLock()
-        self._last_frame: Optional[np.ndarray] = None
-        self._capture: Optional[WindowsCapture] = None
-        self._running = False
+        self._sct = mss.mss()
+        logging.info("event=capturer type=mss status=initialized")
 
-        if WindowsCapture is None:
-            logging.warning("event=wgc status=unavailable reason=missing_module")
-            return
+    def grab(self, region: "Region") -> np.ndarray:
+        width = region.right - region.left
+        height = region.bottom - region.top
+        if width <= 0 or height <= 0:
+            raise ValueError(f"invalid_region left={region.left} top={region.top} right={region.right} bottom={region.bottom}")
 
-        self._capture = WindowsCapture(
-            cursor_capture=False,
-            draw_border=False,
-            monitor_index=1,
-            window_name=None,
-        )
+        monitor = {
+            "left": int(region.left),
+            "top": int(region.top),
+            "width": int(width),
+            "height": int(height),
+        }
 
-        @self._capture.event
-        def on_frame_arrived(frame, _capture_control) -> None:
-            try:
-                buffer = frame.convert_to_bgr()
-                with self._lock:
-                    self._last_frame = np.asarray(buffer).copy()
-            except Exception:
-                logging.exception("event=wgc status=frame_copy_failed")
-
-        @self._capture.event
-        def on_closed() -> None:
-            self._running = False
-            logging.warning("event=wgc status=closed")
-
-    def start(self) -> None:
-        if self._capture is None or self._running:
-            return
-        self._capture.start_free_threaded()
-        self._running = True
-        logging.info("event=wgc status=started")
-
-    def grab(self, region: Region) -> Optional[np.ndarray]:
-        if not self._running:
-            self.start()
         with self._lock:
-            frame = None if self._last_frame is None else self._last_frame.copy()
-        if frame is None:
-            return None
-        h, w = frame.shape[:2]
-        left = max(0, min(region.left, w - 1))
-        right = max(0, min(region.right, w))
-        top = max(0, min(region.top, h - 1))
-        bottom = max(0, min(region.bottom, h))
-        if right <= left or bottom <= top:
-            return None
-        return frame[top:bottom, left:right]
+            raw = self._sct.grab(monitor)
+
+        frame = np.asarray(raw)
+        if frame.size == 0:
+            raise RuntimeError("empty_frame size=0")
+        if frame.ndim != 3 or frame.shape[2] < 3:
+            raise RuntimeError(f"unexpected_frame_shape shape={frame.shape}")
+
+        return frame[:, :, :3].copy()
 
 
 class POINT(ctypes.Structure):
@@ -202,7 +178,7 @@ class EU5LocationFinder:
         self.pick_armed = False
         self.last_lbutton_down = False
 
-        self.camera = WGCCapturer()
+        self.camera: Capturer = MSSCapturer()
         self.monitor_thread = threading.Thread(
             target=self.monitor_loop,
             daemon=True,
@@ -230,6 +206,9 @@ class EU5LocationFinder:
         self.term_entry: Optional[tk.Entry] = None
         self.dialog_previous_active_hwnd: Optional[int] = None
         self.overlay_photo = None
+        self.preview_window: Optional[tk.Toplevel] = None
+        self.preview_image_label: Optional[tk.Label] = None
+        self.preview_photo = None
         self.request_term_dialog = False
         self.request_clear_alert = False
         self.pending_alert: Optional[Tuple[np.ndarray, str, int]] = None
@@ -484,22 +463,27 @@ class EU5LocationFinder:
         if not self.region:
             return None, False, "region_unset"
 
+        reason = "unknown"
         for attempt in range(3):
             try:
                 frame = self.camera.grab(region=self.region)
-                if frame is None:
-                    reason = "None"
+                if frame.size == 0:
+                    reason = "size_zero"
+                elif frame.shape[0] <= 0 or frame.shape[1] <= 0:
+                    reason = f"invalid_size:{frame.shape[1]}x{frame.shape[0]}"
                 elif np.mean(frame) < 1.0:
-                    reason = "black"
+                    reason = "black_frame"
                 else:
+                    width = int(frame.shape[1])
+                    height = int(frame.shape[0])
                     with self.state_lock:
                         self.capture_fail_streak = 0
-                    return frame, True, "ok"
+                    return frame, True, f"size={width}x{height}"
 
                 logging.warning("event=capture status=retry attempt=%s reason=%s", attempt + 1, reason)
-            except Exception:
-                reason = "exception"
-                logging.exception("event=capture status=retry attempt=%s reason=exception", attempt + 1)
+            except Exception as exc:
+                reason = f"exception:{exc}"
+                logging.exception("event=capture status=retry attempt=%s reason=%s", attempt + 1, reason)
 
             time.sleep(0.05)
 
@@ -655,7 +639,42 @@ class EU5LocationFinder:
 
         row5 = tk.Frame(panel, bg="#1e1e1e")
         row5.pack(fill="x", padx=8, pady=2)
-        tk.Button(row5, text="Quit", width=36, command=self.root.destroy).pack(side="left", padx=2)
+        tk.Button(row5, text="Preview", width=17, command=self.preview_capture).pack(side="left", padx=2)
+        tk.Button(row5, text="Quit", width=17, command=self.root.destroy).pack(side="left", padx=2)
+
+    def preview_capture(self) -> None:
+        frame, cap_ok, cap_reason = self.capture_region()
+        with self.state_lock:
+            self.last_capture_ok = cap_ok
+            self.last_capture_reason = cap_reason
+        if frame is None:
+            self.print_status(f"Preview failed: {cap_reason}")
+            return
+        self.show_preview_window(frame)
+
+    def show_preview_window(self, frame: np.ndarray) -> None:
+        if self.preview_window and not self.preview_window.winfo_exists():
+            self.preview_window = None
+            self.preview_image_label = None
+
+        if self.preview_window is None:
+            self.preview_window = tk.Toplevel(self.root)
+            self.preview_window.title("Capture Preview")
+            self.preview_window.attributes("-topmost", True)
+            self.preview_window.configure(bg="#111111")
+            self.preview_image_label = tk.Label(self.preview_window, bg="#111111")
+            self.preview_image_label.pack(padx=8, pady=8)
+
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        pil = Image.fromarray(rgb)
+        self.preview_photo = ImageTk.PhotoImage(pil)
+
+        if self.preview_image_label:
+            self.preview_image_label.configure(image=self.preview_photo)
+
+        self.preview_window.deiconify()
+        self.preview_window.lift()
+        self.print_status(f"Preview updated: size={frame.shape[1]}x{frame.shape[0]}")
 
     def test_alert(self) -> None:
         frame = np.zeros((90, 360, 3), dtype=np.uint8)
