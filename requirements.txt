@@ -1,0 +1,7 @@
+dxcam
+opencv-python
+pytesseract
+rapidfuzz
+keyboard
+pillow
+numpy
