@@ -130,8 +130,13 @@ class EU5LocationFinder:
         self.fuzz_threshold = FUZZ_THRESHOLD_DEFAULT
         self.recent_matches = deque(maxlen=4)
         self.last_ocr_text = ""
+        self.last_capture_ok = False
+        self.last_capture_reason = "not_started"
         self.last_heartbeat_time = 0.0
         self.monitor_thread_started = False
+        self.pending_pick_corner: Optional[str] = None
+        self.pick_armed = False
+        self.last_lbutton_down = False
 
         self.camera = dxcam.create(output_color="BGR")
         self.monitor_thread = threading.Thread(
@@ -150,6 +155,10 @@ class EU5LocationFinder:
         self.overlay_text_label: Optional[tk.Label] = None
         self.term_status_window: Optional[tk.Toplevel] = None
         self.term_status_label: Optional[tk.Label] = None
+        self.control_panel: Optional[tk.Toplevel] = None
+        self.control_info_label: Optional[tk.Label] = None
+        self.monitor_button: Optional[tk.Button] = None
+        self.fast_button: Optional[tk.Button] = None
         self.term_dialog_window: Optional[tk.Toplevel] = None
         self.term_entry: Optional[tk.Entry] = None
         self.dialog_previous_active_hwnd: Optional[int] = None
@@ -166,7 +175,7 @@ class EU5LocationFinder:
             logging.warning("event=tesseract status=missing path=%s", DEFAULT_TESSERACT_PATH)
 
         self.setup_hotkeys()
-        self.create_term_status_window()
+        self.create_control_panel()
         self.root.after(50, self.ui_tick)
         self.print_status("Ready. F7=word F8=monitor F9/F10=region F5=fast F6=clear")
 
@@ -250,18 +259,21 @@ class EU5LocationFinder:
         except Exception:
             logging.exception("event=hotkey_error key=F7")
 
-    def toggle_fast_mode(self) -> None:
-        self.log_hotkey("F5")
+    def toggle_fast_mode(self, source: str = "hotkey") -> None:
+        if source == "hotkey":
+            self.log_hotkey("F5")
         try:
             with self.state_lock:
                 self.fast_mode = not self.fast_mode
                 fast_mode = self.fast_mode
             self.print_status(f"Fast mode: {'ON' if fast_mode else 'OFF'}")
+            logging.info("fast=%s source=%s", "ON" if fast_mode else "OFF", source)
         except Exception:
             logging.exception("event=hotkey_error key=F5")
 
-    def toggle_monitor(self) -> None:
-        self.log_hotkey("F8")
+    def toggle_monitor(self, source: str = "hotkey") -> None:
+        if source == "hotkey":
+            self.log_hotkey("F8")
         try:
             with self.state_lock:
                 alert_active = self.alert_active
@@ -276,13 +288,17 @@ class EU5LocationFinder:
             if not search_term:
                 self.print_status("Search term is empty. Use F7 first.")
                 return
-            with self.state_lock:
-                self.monitoring = not self.monitoring
-                monitoring = self.monitoring
-                self.recent_matches.clear()
-            self.print_status(f"Monitoring: {'ON' if monitoring else 'OFF'}")
+            self.set_monitoring(not self.monitoring, source=source)
         except Exception:
             logging.exception("event=hotkey_error key=F8")
+
+    def set_monitoring(self, value: bool, source: str) -> None:
+        with self.state_lock:
+            self.monitoring = value
+            monitoring = self.monitoring
+            self.recent_matches.clear()
+        self.print_status(f"Monitoring: {'ON' if monitoring else 'OFF'}")
+        logging.info("monitor=%s source=%s", "ON" if monitoring else "OFF", source)
 
     def clear_alert(self) -> None:
         self.log_hotkey("F6")
@@ -306,6 +322,9 @@ class EU5LocationFinder:
                         term = self.search_term
                     if monitoring and not alert_active:
                         frame, cap_ok, cap_reason = self.capture_region()
+                        with self.state_lock:
+                            self.last_capture_ok = cap_ok
+                            self.last_capture_reason = cap_reason or "ok"
                         if frame is not None:
                             hit, score, token = self.detect_term(frame)
                             with self.state_lock:
@@ -469,24 +488,119 @@ class EU5LocationFinder:
             logging.exception("event=beep status=failed")
 
     def create_term_status_window(self) -> None:
-        self.term_status_window = tk.Toplevel(self.root)
-        self.term_status_window.title("EU5 Search Term")
-        self.term_status_window.attributes("-topmost", True)
-        self.term_status_window.resizable(False, False)
-        self.term_status_window.configure(bg="#202020")
-        self.term_status_label = tk.Label(
-            self.term_status_window,
-            text="現在の検索語: (未設定)",
-            font=("Meiryo", 10, "bold"),
+        # Kept for backward compatibility.
+        self.create_control_panel()
+
+    def create_control_panel(self) -> None:
+        self.control_panel = tk.Toplevel(self.root)
+        panel = self.control_panel
+        panel.title("EU5 Control")
+        panel.attributes("-topmost", True)
+        panel.resizable(False, False)
+        panel.configure(bg="#1e1e1e")
+        panel.geometry("360x240+20+20")
+
+        self.control_info_label = tk.Label(
+            panel,
+            text="",
+            font=("Meiryo", 9),
             fg="#ffffff",
-            bg="#202020",
-            padx=8,
-            pady=6,
+            bg="#1e1e1e",
+            justify="left",
+            anchor="w",
         )
-        self.term_status_label.pack()
+        self.control_info_label.pack(fill="x", padx=8, pady=(8, 4))
+
+        row1 = tk.Frame(panel, bg="#1e1e1e")
+        row1.pack(fill="x", padx=8, pady=2)
+        tk.Button(row1, text="Set Term", width=11, command=self.set_search_term).pack(side="left", padx=2)
+        tk.Button(row1, text="Pick LT", width=11, command=self.pick_left_top).pack(side="left", padx=2)
+        tk.Button(row1, text="Pick RB", width=11, command=self.pick_right_bottom).pack(side="left", padx=2)
+
+        row2 = tk.Frame(panel, bg="#1e1e1e")
+        row2.pack(fill="x", padx=8, pady=2)
+        self.monitor_button = tk.Button(row2, text="Monitor ON/OFF", width=17, command=self.toggle_monitor_ui)
+        self.monitor_button.pack(side="left", padx=2)
+        self.fast_button = tk.Button(row2, text="Fast ON/OFF", width=17, command=self.toggle_fast_mode_ui)
+        self.fast_button.pack(side="left", padx=2)
+
+        row3 = tk.Frame(panel, bg="#1e1e1e")
+        row3.pack(fill="x", padx=8, pady=2)
+        tk.Button(row3, text="Clear Alert", width=17, command=self.clear_alert).pack(side="left", padx=2)
+        tk.Button(row3, text="Quit", width=17, command=self.root.destroy).pack(side="left", padx=2)
+
+    def toggle_monitor_ui(self) -> None:
+        self.toggle_monitor(source="ui")
+
+    def toggle_fast_mode_ui(self) -> None:
+        self.toggle_fast_mode(source="ui")
+
+    def pick_left_top(self) -> None:
+        self.pending_pick_corner = "lt"
+        self.pick_armed = False
+        self.print_status("Pick LT armed: click target left-top point.")
+
+    def pick_right_bottom(self) -> None:
+        self.pending_pick_corner = "rb"
+        self.pick_armed = False
+        self.print_status("Pick RB armed: click target right-bottom point.")
+
+    def poll_point_pick(self) -> None:
+        down = bool(ctypes.windll.user32.GetAsyncKeyState(0x01) & 0x8000)
+        if self.pending_pick_corner and not self.pick_armed and not down:
+            self.pick_armed = True
+
+        if self.pending_pick_corner and self.pick_armed and down and not self.last_lbutton_down:
+            x, y = get_cursor_pos()
+            if self.pending_pick_corner == "lt":
+                self.corner_lt = (x, y)
+                self.print_status(f"LT captured: {self.corner_lt}")
+            elif self.pending_pick_corner == "rb":
+                self.corner_rb = (x, y)
+                self.print_status(f"RB captured: {self.corner_rb}")
+                if not self.corner_lt:
+                    self.print_status("Left-top is missing. Capture LT first.")
+                else:
+                    left = min(self.corner_lt[0], self.corner_rb[0])
+                    top = min(self.corner_lt[1], self.corner_rb[1])
+                    right = max(self.corner_lt[0], self.corner_rb[0])
+                    bottom = max(self.corner_lt[1], self.corner_rb[1])
+                    region = Region(left, top, right, bottom)
+                    if region.is_valid():
+                        self.region = region
+                        self.save_region()
+                    else:
+                        self.print_status("Invalid region; capture LT/RB again.")
+            self.pending_pick_corner = None
+            self.pick_armed = False
+
+        self.last_lbutton_down = down
+
+    def refresh_control_panel(self) -> None:
+        if not self.control_info_label:
+            return
+        with self.state_lock:
+            term = self.search_term or "(unset)"
+            region_txt = "SET" if self.region else "UNSET"
+            monitor_txt = "ON" if self.monitoring else "OFF"
+            fast_txt = "ON" if self.fast_mode else "OFF"
+            cap_txt = "ok" if self.last_capture_ok else "FAIL"
+            ocr_chars = len(self.last_ocr_text)
+            sample = self.last_ocr_text[:24].replace("\n", " ")
+        pick_state = self.pending_pick_corner.upper() if self.pending_pick_corner else "-"
+        self.control_info_label.config(
+            text=(
+                f"TERM: {term}\n"
+                f"REGION: {region_txt}  MONITOR: {monitor_txt}  FAST: {fast_txt}\n"
+                f"LAST: CAPTURE {cap_txt}, OCR chars={ocr_chars}, sample=\"{sample}\"\n"
+                f"PICK: {pick_state}"
+            )
+        )
 
     def ui_tick(self) -> None:
+        self.poll_point_pick()
         self.process_ui_requests()
+        self.refresh_control_panel()
         self.root.after(50, self.ui_tick)
 
     def process_ui_requests(self) -> None:
